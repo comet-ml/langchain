@@ -481,7 +481,7 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
             langchain_asset.save_agent(langchain_asset_path)
             self.experiment.log_model(model_name, str(langchain_asset_path))
 
-        except NotImplementedError as e:
+        except (AttributeError, NotImplementedError) as e:
             comet_ml.LOGGER.warning(
                 f"Could not save Langchain Asset for {langchain_asset.__class__.__name__}"
             )
@@ -492,7 +492,9 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.experiment.log_table(f"langchain-llm-session.csv", llm_session_df)
 
         # Log the langchain low-level records as a JSON file directly
-        self.experiment.log_asset_data(self.action_records, "langchain-action_records.json")
+        self.experiment.log_asset_data(
+            self.action_records, "langchain-action_records.json"
+        )
 
         self._log_visualizations(llm_session_df)
 
