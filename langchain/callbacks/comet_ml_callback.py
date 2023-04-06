@@ -13,26 +13,8 @@ from langchain.callbacks.utils import (
     import_textstat,
     load_json,
 )
-from langchain.schema import AgentAction, AgentFinish, LLMResult
+from langchain.schema import AgentAction, AgentFinish, Generation, LLMResult
 
-COMPLEXITY_METRIC_NAMES = [
-    "flesch_reading_ease",
-    "flesch_kincaid_grade",
-    "smog_index",
-    "coleman_liau_index",
-    "automated_readability_index",
-    "dale_chall_readability_score",
-    "difficult_words",
-    "linsear_write_formula",
-    "gunning_fog",
-    "text_standard",
-    "fernandez_huerta",
-    "szigriszt_pazos",
-    "gutierrez_polini",
-    "crawford",
-    "gulpease_index",
-    "osman",
-]
 LANGCHAIN_MODEL_NAME = "langchain-model"
 
 
@@ -47,7 +29,7 @@ def import_comet_ml() -> Any:
     return comet_ml
 
 
-def _get_experiment(workspace=None, project_name=None):
+def _get_experiment(workspace: str = None, project_name: str = None) -> Any:
     comet_ml = import_comet_ml()
 
     experiment = comet_ml.config.get_global_experiment()
@@ -60,7 +42,7 @@ def _get_experiment(workspace=None, project_name=None):
     return experiment
 
 
-def _fetch_text_complexity_metrics(text):
+def _fetch_text_complexity_metrics(text: str) -> dict:
     textstat = import_textstat()
     text_complexity_metrics = {
         "flesch_reading_ease": textstat.flesch_reading_ease(text),
@@ -83,7 +65,7 @@ def _fetch_text_complexity_metrics(text):
     return text_complexity_metrics
 
 
-def _summarize_metrics_for_generated_outputs(metrics):
+def _summarize_metrics_for_generated_outputs(metrics: Sequence) -> dict:
     pd = import_pandas()
     metrics_df = pd.DataFrame(metrics)
     metrics_summary = metrics_df.describe()
@@ -118,7 +100,8 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         name: Optional[str] = None,
         visualizations: Optional[str] = None,
         complexity_metrics: bool = False,
-        stream_logs: bool = False,
+        custom_metrics: Optional[callable] = None,
+        stream_logs: bool = True,
     ) -> None:
         """Initialize callback handler."""
 
@@ -131,6 +114,7 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.tags = tags
         self.visualizations = visualizations
         self.complexity_metrics = complexity_metrics
+        self.custom_metrics = custom_metrics
         self.stream_logs = stream_logs
         self.temp_dir = tempfile.TemporaryDirectory()
 
@@ -181,6 +165,9 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
             self.on_llm_start_records.append(prompt_resp)
             self.action_records.append(prompt_resp)
 
+            if self.stream_logs:
+                self._log_stream(prompt, metadata, self.step)
+
     def on_llm_new_token(self, token: str, **kwargs: Any) -> None:
         """Run when LLM generates a new token."""
         self.step += 1
@@ -203,23 +190,36 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         metadata.update(flatten_dict(response.llm_output or {}))
         metadata.update(self.get_custom_callback_meta())
 
-        output_metrics = []
-        for generations in response.generations:
-            for generation in generations:
+        output_complexity_metrics = []
+        output_custom_metrics = []
+
+        for prompt_idx, generations in enumerate(response.generations):
+            for gen_idx, generation in enumerate(generations):
                 text = generation.text
 
                 generation_resp = deepcopy(metadata)
                 generation_resp.update(flatten_dict(generation.dict()))
 
-                text_metrics = self._get_text_metrics(text)
-                generation_resp.update(text_metrics)
+                complexity_metrics = self._get_complexity_metrics(text)
+                if complexity_metrics:
+                    output_complexity_metrics.append(complexity_metrics)
+                    generation_resp.update(complexity_metrics)
+
+                custom_metrics = self._get_custom_metrics(
+                    generation, prompt_idx, gen_idx
+                )
+                if custom_metrics:
+                    output_custom_metrics.append(custom_metrics)
+                    generation_resp.update(custom_metrics)
+
+                if self.stream_logs:
+                    self._log_stream(text, metadata, self.step)
+
                 self.action_records.append(generation_resp)
                 self.on_llm_end_records.append(generation_resp)
 
-                if text_metrics:
-                    output_metrics.append(text_metrics)
-
-        self._log_text_metrics(output_metrics, step=self.step)
+        self._log_text_metrics(output_complexity_metrics, step=self.step)
+        self._log_text_metrics(output_custom_metrics, step=self.step)
 
     def on_llm_error(
         self, error: Union[Exception, KeyboardInterrupt], **kwargs: Any
@@ -244,12 +244,18 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         chain_input = inputs["input"]
         if isinstance(chain_input, str):
             input_resp = deepcopy(resp)
+            if self.stream_logs:
+                self._log_stream(chain_input, resp, self.step)
+
             input_resp["input"] = chain_input
             self.action_records.append(input_resp)
 
         elif isinstance(chain_input, list):
             for inp in chain_input:
                 input_resp = deepcopy(resp)
+                if self.stream_logs:
+                    self._log_stream(inp, resp, self.step)
+
                 input_resp.update(inp)
                 self.action_records.append(input_resp)
 
@@ -263,9 +269,14 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.ends += 1
 
         resp = self._init_resp()
-        resp.update({"action": "on_chain_end", "outputs": outputs["output"]})
+        resp.update({"action": "on_chain_end"})
         resp.update(self.get_custom_callback_meta())
+        outputs = outputs["output"]
 
+        if self.stream_logs:
+            self._log_stream(outputs, resp, self.step)
+
+        resp.update({"outputs": outputs})
         self.action_records.append(resp)
 
     def on_chain_error(
@@ -284,10 +295,13 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.starts += 1
 
         resp = self._init_resp()
-        resp.update({"action": "on_tool_start", "input_str": input_str})
+        resp.update({"action": "on_tool_start"})
         resp.update(flatten_dict(serialized))
         resp.update(self.get_custom_callback_meta())
+        if self.stream_logs:
+            self._log_stream(input_str, resp, self.step)
 
+        resp.update({"input_str": input_str})
         self.action_records.append(resp)
 
     def on_tool_end(self, output: str, **kwargs: Any) -> None:
@@ -297,9 +311,12 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.ends += 1
 
         resp = self._init_resp()
-        resp.update({"action": "on_tool_end", "output": output})
+        resp.update({"action": "on_tool_end"})
         resp.update(self.get_custom_callback_meta())
+        if self.stream_logs:
+            self._log_stream(output, resp, self.step)
 
+        resp.update({"output": output})
         self.action_records.append(resp)
 
     def on_tool_error(
@@ -317,9 +334,12 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.text_ctr += 1
 
         resp = self._init_resp()
-        resp.update({"action": "on_text", "text": text})
+        resp.update({"action": "on_text"})
         resp.update(self.get_custom_callback_meta())
+        if self.stream_logs:
+            self._log_stream(text, resp, self.step)
 
+        resp.update({"text": text})
         self.action_records.append(resp)
 
     def on_agent_finish(self, finish: AgentFinish, **kwargs: Any) -> None:
@@ -329,14 +349,15 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.ends += 1
 
         resp = self._init_resp()
-        resp.update(
-            {
-                "action": "on_agent_finish",
-                "output": finish.return_values["output"],
-                "log": finish.log,
-            }
-        )
+        output = (finish.return_values["output"],)
+        log = finish.log
+
+        resp.update({"action": "on_agent_finish", "log": log})
         resp.update(self.get_custom_callback_meta())
+        if self.stream_logs:
+            self._log_stream(output, resp, self.step)
+
+        resp.update({"output": output})
         self.action_records.append(resp)
 
     def on_agent_action(self, action: AgentAction, **kwargs: Any) -> Any:
@@ -345,20 +366,21 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.tool_starts += 1
         self.starts += 1
 
+        tool = action.tool
+        tool_input = action.tool_input
+        log = action.log
+
         resp = self._init_resp()
-        resp.update(
-            {
-                "action": "on_agent_action",
-                "tool": action.tool,
-                "tool_input": action.tool_input,
-                "log": action.log,
-            }
-        )
+        resp.update({"action": "on_agent_action", "log": log, "tool": tool})
         resp.update(self.get_custom_callback_meta())
+        if self.stream_logs:
+            self._log_stream(tool_input, resp, self.step)
+
+        resp.update({"tool_input": tool_input})
         self.action_records.append(resp)
 
-    def _get_text_metrics(self, text: str) -> dict:
-        """Compute text metrics using textstat.
+    def _get_complexity_metrics(self, text: str) -> dict:
+        """Compute text complexity metrics using textstat.
 
         Parameters:
             text (str): The text to analyze.
@@ -373,6 +395,27 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
 
         return resp
 
+    def _get_custom_metrics(
+        self, generation: Generation, prompt_idx: int, gen_idx: int
+    ) -> dict:
+        """Compute Custom Metrics for an LLM Generated Output
+
+        Args:
+            generation (LLMResult): Output generation from an LLM
+            prompt_idx (int): List index of the input prompt
+            gen_idx (int): List index of the generated output
+
+        Returns:
+            dict: A dictionary containing the custom metrics.
+        """
+
+        resp = {}
+        if self.custom_metrics:
+            custom_metrics = self.custom_metrics(generation, prompt_idx, gen_idx)
+            resp.update(custom_metrics)
+
+        return resp
+
     def flush_tracker(
         self,
         langchain_asset: Any = None,
@@ -383,7 +426,7 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         name: Optional[str] = None,
         visualizations: Optional[str] = None,
         complexity_metrics: bool = False,
-        stream_logs: bool = False,
+        custom_metrics: Optional[callable] = None,
         finish: bool = False,
         reset: bool = False,
     ) -> None:
@@ -416,16 +459,18 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
                 name,
                 visualizations,
                 complexity_metrics,
-                stream_logs,
+                custom_metrics,
             )
 
-    def _log_stream(self, prompt_resp, step):
-        self.experiment.log_text(prompt_resp, step=step)
+    def _log_stream(self, prompt: str, metadata: dict, step: int) -> None:
+        self.experiment.log_text(prompt, metadata=metadata, step=step)
 
-    def _log_model(self, langchain_asset):
+    def _log_model(self, langchain_asset: Any) -> None:
         comet_ml = import_comet_ml()
 
-        self.experiment.log_parameters(langchain_asset.dict(), prefix="model")
+        model_parameters = self._get_llm_parameters(langchain_asset)
+        self.experiment.log_parameters(model_parameters, prefix="model")
+
         langchain_asset_path = Path(self.temp_dir.name, "model.json")
         model_name = self.name if self.name else LANGCHAIN_MODEL_NAME
         try:
@@ -439,33 +484,30 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         except NotImplementedError as e:
             comet_ml.LOGGER.warning("Could not save Langchain Asset")
 
-    def _log_session(self, langchain_asset):
-        langchain_asset_parameters = langchain_asset.dict()
-        num_generations_per_prompt = langchain_asset_parameters.get("n")
-
-        dataframes_map = self._create_sessions_analysis_dataframe_map(
-            num_generations_per_prompt
-        )
-        for key, dataframe in dataframes_map.items():
+    def _log_session(self, langchain_asset: Any = None):
+        session_dataframes = self._create_session_analysis_dataframes(langchain_asset)
+        for key, dataframe in session_dataframes.items():
             self.experiment.log_table(f"langchain-{key}.json", dataframe)
             self.experiment.log_table(f"langchain-{key}.csv", dataframe)
 
-        session_df = dataframes_map["llm_session"]
-        self._log_visualizations(session_df)
+        llm_session_df = session_dataframes["llm_session"]
+        self._log_visualizations(llm_session_df)
 
-    def _log_text_metrics(self, text_metrics, step):
-        if not text_metrics:
+    def _log_text_metrics(self, metrics: Sequence[dict], step: int) -> None:
+        if not metrics:
             return
 
-        text_metrics_summary = _summarize_metrics_for_generated_outputs(text_metrics)
-        for key, value in text_metrics_summary.items():
+        metrics_summary = _summarize_metrics_for_generated_outputs(metrics)
+        for key, value in metrics_summary.items():
             self.experiment.log_metrics(value, prefix=key, step=step)
 
-    def _log_visualizations(self, session_df):
+    def _log_visualizations(self, session_df) -> None:
         if not (self.visualizations and self.nlp):
             return
 
         spacy = import_spacy()
+        comet_ml = import_comet_ml()
+
         prompts = session_df["prompts"].tolist()
         outputs = session_df["text"].tolist()
 
@@ -489,7 +531,7 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
                         step=idx,
                     )
                 except Exception as e:
-                    print(e)
+                    comet_ml.LOGGER.warning(e)
 
         return
 
@@ -502,8 +544,8 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         name: Optional[str] = None,
         visualizations: Optional[str] = None,
         complexity_metrics: bool = False,
-        stream_logs: bool = False,
-    ):
+        custom_metrics: Optional[callable] = None,
+    ) -> None:
         _task_type = task_type if task_type else self.task_type
         _workspace = workspace if workspace else self.workspace
         _project_name = project_name if project_name else self.project_name
@@ -513,7 +555,7 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         _complexity_metrics = (
             complexity_metrics if complexity_metrics else self.complexity_metrics
         )
-        _stream_logs = stream_logs if stream_logs else self.stream_logs
+        _custom_metrics = custom_metrics if custom_metrics else self.custom_metrics
 
         self.__init__(
             task_type=_task_type,
@@ -523,23 +565,27 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
             name=_name,
             visualizations=_visualizations,
             complexity_metrics=_complexity_metrics,
-            stream_logs=_stream_logs,
+            custom_metrics=_custom_metrics,
         )
 
         self.reset_callback_meta()
         self.temp_dir = tempfile.TemporaryDirectory()
 
-    def _create_sessions_analysis_dataframe_map(self, num_generations_per_prompt=1):
+    def _create_session_analysis_dataframes(self, langchain_asset: Any = None) -> dict:
         pd = import_pandas()
+
+        llm_parameters = self._get_llm_parameters(langchain_asset)
+        num_generations_per_prompt = llm_parameters.get("n", 1)
+
         action_records_df = pd.DataFrame(self.action_records)
 
         llm_start_records_df = pd.DataFrame(self.on_llm_start_records)
-        # Repeat each row based on the number of outputs generated per prompt
-        # This is so the input prompt df aligns with the output df
+        # Repeat each input row based on the number of outputs generated per prompt
         llm_start_records_df = llm_start_records_df.loc[
             llm_start_records_df.index.repeat(num_generations_per_prompt)
         ].reset_index(drop=True)
         llm_end_records_df = pd.DataFrame(self.on_llm_end_records)
+
         llm_session_df = pd.merge(
             llm_start_records_df,
             llm_end_records_df,
@@ -548,8 +594,21 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
             suffixes=["_llm_start", "_llm_end"],
         )
 
-        dataframe_map = dict(
+        sessions_dfs = dict(
             action_records=action_records_df, llm_session=llm_session_df
         )
 
-        return dataframe_map
+        return sessions_dfs
+
+    def _get_llm_parameters(self, langchain_asset: Any = None) -> dict:
+        if not langchain_asset:
+            return {}
+
+        if hasattr(langchain_asset, "agent"):
+            llm_parameters = langchain_asset.agent.llm_chain.llm.dict()
+        elif hasattr(langchain_asset, "llm"):
+            llm_parameters = langchain_asset.llm.dict()
+        else:
+            llm_parameters = langchain_asset.dict()
+
+        return llm_parameters
