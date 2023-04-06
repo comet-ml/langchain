@@ -476,16 +476,16 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         try:
             if hasattr(langchain_asset, "save"):
                 langchain_asset.save(langchain_asset_path)
-            elif hasattr(langchain_asset, "save_agent"):
-                langchain_asset.save_agent(langchain_asset_path)
-
-            self.experiment.log_model(model_name, str(langchain_asset_path))
-
+                self.experiment.log_model(model_name, str(langchain_asset_path))
         except (ValueError, AttributeError, NotImplementedError) as e:
-            comet_ml.LOGGER.warning(
-                f"{e}"
-                f" Could not save Langchain Asset for {langchain_asset.__class__.__name__}"
-            )
+            if hasattr(langchain_asset, "save_agent"):
+                langchain_asset.save_agent(langchain_asset_path)
+                self.experiment.log_model(model_name, str(langchain_asset_path))
+            else:
+                comet_ml.LOGGER.warning(
+                    f"{e}"
+                    f" Could not save Langchain Asset for {langchain_asset.__class__.__name__}"
+                )
 
     def _log_session(self, langchain_asset: Any = None):
         llm_session_df = self._create_session_analysis_dataframe(langchain_asset)
