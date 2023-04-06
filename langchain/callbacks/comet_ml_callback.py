@@ -239,26 +239,20 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         resp.update(flatten_dict(serialized))
         resp.update(self.get_custom_callback_meta())
 
-        chain_input = inputs["input"]
-        if isinstance(chain_input, str):
-            input_resp = deepcopy(resp)
-            if self.stream_logs:
-                self._log_stream(chain_input, resp, self.step)
+        comet_ml = import_comet_ml()
 
-            input_resp["input"] = chain_input
-            self.action_records.append(input_resp)
-
-        elif isinstance(chain_input, list):
-            for inp in chain_input:
+        for chain_input_key, chain_input_val in inputs.items():
+            if isinstance(chain_input_val, str):
                 input_resp = deepcopy(resp)
                 if self.stream_logs:
-                    self._log_stream(inp, resp, self.step)
-
-                input_resp.update(inp)
+                    self._log_stream(chain_input_val, resp, self.step)
+                input_resp.update({chain_input_key: chain_input_val})
                 self.action_records.append(input_resp)
 
-        else:
-            raise ValueError("Unexpected data format provided!")
+            else:
+                comet_ml.LOGGER.warning(
+                    f"Unexpected data format provided! Input Value for {chain_input_key} will not be logged"
+                )
 
     def on_chain_end(self, outputs: Dict[str, Any], **kwargs: Any) -> None:
         """Run when chain ends running."""
@@ -269,13 +263,20 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         resp = self._init_resp()
         resp.update({"action": "on_chain_end"})
         resp.update(self.get_custom_callback_meta())
-        outputs = outputs["output"]
 
-        if self.stream_logs:
-            self._log_stream(outputs, resp, self.step)
+        comet_ml = import_comet_ml()
 
-        resp.update({"outputs": outputs})
-        self.action_records.append(resp)
+        for chain_output_key, chain_output_val in outputs.items():
+            if isinstance(chain_output_val, str):
+                output_resp = deepcopy(resp)
+                if self.stream_logs:
+                    self._log_stream(chain_output_val, resp, self.step)
+                output_resp.update({chain_output_key: chain_output_val})
+                self.action_records.append(output_resp)
+            else:
+                comet_ml.LOGGER.warning(
+                    f"Unexpected data format provided! Output Value for {chain_output_key} will not be logged"
+                )
 
     def on_chain_error(
         self, error: Union[Exception, KeyboardInterrupt], **kwargs: Any
@@ -471,6 +472,7 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
 
         langchain_asset_path = Path(self.temp_dir.name, "model.json")
         model_name = self.name if self.name else LANGCHAIN_MODEL_NAME
+
         try:
             langchain_asset.save(langchain_asset_path)
             self.experiment.log_model(model_name, str(langchain_asset_path))
@@ -480,7 +482,9 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
             self.experiment.log_model(model_name, str(langchain_asset_path))
 
         except NotImplementedError as e:
-            comet_ml.LOGGER.warning("Could not save Langchain Asset")
+            comet_ml.LOGGER.warning(
+                f"Could not save Langchain Asset for {langchain_asset.__class__.__name__}"
+            )
 
     def _log_session(self, langchain_asset: Any = None):
         llm_session_df = self._create_session_analysis_dataframe(langchain_asset)
@@ -596,12 +600,21 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
     def _get_llm_parameters(self, langchain_asset: Any = None) -> dict:
         if not langchain_asset:
             return {}
-
-        if hasattr(langchain_asset, "agent"):
-            llm_parameters = langchain_asset.agent.llm_chain.llm.dict()
-        elif hasattr(langchain_asset, "llm"):
-            llm_parameters = langchain_asset.llm.dict()
-        else:
-            llm_parameters = langchain_asset.dict()
+        try:
+            if hasattr(langchain_asset, "agent"):
+                llm_parameters = langchain_asset.agent.llm_chain.llm.dict()
+            elif hasattr(langchain_asset, "llm_chain"):
+                llm_parameters = langchain_asset.llm_chain.llm.dict()
+            elif hasattr(langchain_asset, "llm"):
+                llm_parameters = langchain_asset.llm.dict()
+            else:
+                llm_parameters = langchain_asset.dict()
+        except Exception as e:
+            return {}
 
         return llm_parameters
+
+    @property
+    def always_verbose(self) -> bool:
+        """Whether to call verbose callbacks even if verbose is False."""
+        return True
