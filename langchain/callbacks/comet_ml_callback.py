@@ -7,11 +7,9 @@ from langchain.callbacks.base import BaseCallbackHandler
 from langchain.callbacks.utils import (
     BaseMetadataCallbackHandler,
     flatten_dict,
-    hash_string,
     import_pandas,
     import_spacy,
     import_textstat,
-    load_json,
 )
 from langchain.schema import AgentAction, AgentFinish, Generation, LLMResult
 
@@ -485,12 +483,13 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
             comet_ml.LOGGER.warning("Could not save Langchain Asset")
 
     def _log_session(self, langchain_asset: Any = None):
-        session_dataframes = self._create_session_analysis_dataframes(langchain_asset)
-        for key, dataframe in session_dataframes.items():
-            self.experiment.log_table(f"langchain-{key}.json", dataframe)
-            self.experiment.log_table(f"langchain-{key}.csv", dataframe)
+        llm_session_df = self._create_session_analysis_dataframe(langchain_asset)
+        # Log the cleaned dataframe as a table
+        self.experiment.log_table(f"langchain-llm-session.csv", llm_session_df)
 
-        llm_session_df = session_dataframes["llm_session"]
+        # Log the langchain low-level records as a JSON file directly
+        self.experiment.log_asset_data(self.action_records, "langchain-action_records.json")
+
         self._log_visualizations(llm_session_df)
 
     def _log_text_metrics(self, metrics: Sequence[dict], step: int) -> None:
@@ -571,13 +570,11 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
         self.reset_callback_meta()
         self.temp_dir = tempfile.TemporaryDirectory()
 
-    def _create_session_analysis_dataframes(self, langchain_asset: Any = None) -> dict:
+    def _create_session_analysis_dataframe(self, langchain_asset: Any = None) -> dict:
         pd = import_pandas()
 
         llm_parameters = self._get_llm_parameters(langchain_asset)
         num_generations_per_prompt = llm_parameters.get("n", 1)
-
-        action_records_df = pd.DataFrame(self.action_records)
 
         llm_start_records_df = pd.DataFrame(self.on_llm_start_records)
         # Repeat each input row based on the number of outputs generated per prompt
@@ -594,11 +591,7 @@ class CometCallbackHandler(BaseMetadataCallbackHandler, BaseCallbackHandler):
             suffixes=["_llm_start", "_llm_end"],
         )
 
-        sessions_dfs = dict(
-            action_records=action_records_df, llm_session=llm_session_df
-        )
-
-        return sessions_dfs
+        return llm_session_df
 
     def _get_llm_parameters(self, langchain_asset: Any = None) -> dict:
         if not langchain_asset:
